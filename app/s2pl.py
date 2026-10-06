@@ -17,6 +17,16 @@
 
 读取规则：自身写入优先（读己之写），否则取按提交顺序最新的已提交版本；
 回滚事务的写入对任何后续读取不可见。
+
+事务内保存点（SAVEPOINT name / ROLLBACK TO name）：
+
+- 同一事务内保存点名称不可重复；晚于目标建立的保存点在回退后失效，
+  目标自身仍然保留、可再次回退；引用不存在（含已失效）的名称报错；
+- ROLLBACK TO 撤销目标保存点之后的全部写入（版本链上标记为已回滚、
+  划线保留，不再参与后续读、最终提交、最终状态与依赖图）以及之后全部
+  读依赖；历史步骤本身保留在逐步轨迹中；
+- 回退不释放也不降级任何已取得的 S / X 锁，其他事务继续等待；
+- 死锁发生时仍整笔回滚受害事务（保存点不影响死锁处理）。
 """
 
 from __future__ import annotations
@@ -185,7 +195,7 @@ def simulate_s2pl(initial: "OrderedDict[str, Any]",
     """严格两阶段锁完整推演：轮流尝试队头操作，冲突等待，成环回滚。"""
     txns: "OrderedDict[str, Txn]" = OrderedDict()
     for name, text in txn_scripts:
-        txns[name] = Txn(name=name, ops=parse_txn(name, text))
+        txns[name] = Txn(name=name, ops=parse_txn(name, text, allow_savepoint=True))
     txn_list = list(txns.values())
 
     chains: Dict[str, List[Version]] = OrderedDict()
@@ -196,6 +206,11 @@ def simulate_s2pl(initial: "OrderedDict[str, Any]",
 
     locks: "OrderedDict[str, dict]" = OrderedDict()
     waits: "OrderedDict[str, dict]" = OrderedDict()  # name -> {key, mode, upgrade, blockers}
+    # 事务内保存点：name -> {seq 建立步号, writes 建立时已生效写数,
+    # reads 建立时已生效读数}；按建立顺序保存，回退时弹出晚于目标的项
+    savepoints: Dict[str, "OrderedDict[str, dict]"] = {
+        t.name: OrderedDict() for t in txn_list
+    }
     steps: List[dict] = []
     deadlocks: List[dict] = []
     deadlock_victims: set = set()
@@ -222,6 +237,10 @@ def simulate_s2pl(initial: "OrderedDict[str, Any]",
                 "writes": [{"key": k, "wseq": s} for k, s in x.writes],
                 "locks": _held(locks, x.name),
                 "waiting": x.name in waits,
+                "savepoints": [
+                    {"name": sp, "seq": info["seq"]}
+                    for sp, info in savepoints[x.name].items()
+                ],
             }
             for x in txn_list
         }
@@ -237,6 +256,7 @@ def simulate_s2pl(initial: "OrderedDict[str, Any]",
             "op": op,
             "key": key,
             "value": value,
+            "savepoint": value if op in ("SAVEPOINT", "ROLLBACK TO") else None,
             "read_vid": None,
             "read_value": None,
             "read_source": None,       # own | committed | initial | missing
@@ -251,7 +271,12 @@ def simulate_s2pl(initial: "OrderedDict[str, Any]",
             "dirty_candidate": False,
             "lock_acquired": None,     # {key, mode, upgrade}
             "locks_released": None,    # [{key, mode}]
+            "locks_retained": None,    # ROLLBACK TO 后仍持有的锁 [{key, mode}]
             "resumed": False,          # 等待后重试成功
+            "undone_writes": None,     # ROLLBACK TO 撤销的写 [{key, vid, value, wseq}]
+            "discarded_reads": None,   # ROLLBACK TO 撤销的读依赖 [{key, rseq, vid}]
+            "invalidated_savepoints": None,  # ROLLBACK TO 后失效的保存点名
+            "savepoints_after": None,  # 该步之后仍有效的保存点名
             "info": "",
         }
 
@@ -324,6 +349,72 @@ def simulate_s2pl(initial: "OrderedDict[str, Any]",
             step["info"] = (f"{prefix}取得 {lock_desc}，写入新版本 v{v.vid}={_fmt(value)}"
                             f"（未提交；排他锁保证提交前他人无法读写该键）")
 
+        elif op == "SAVEPOINT":
+            sp_name = value
+            assert isinstance(sp_name, str)
+            if sp_name in savepoints[t.name]:
+                raise SimError(
+                    f"{t.name} 第 {t.pc} 条：保存点名称 “{sp_name}” 在本事务内重复"
+                )
+            savepoints[t.name][sp_name] = {
+                "seq": seq, "writes": len(t.writes), "reads": len(t.reads)
+            }
+            step["info"] = (f"建立保存点 {sp_name}：当前 {len(t.writes)} 个自身写入、"
+                            f"{len(t.reads)} 条读取仍生效；回退到此点将撤销之后的读写，"
+                            f"已取得的锁不释放、不降级")
+
+        elif op == "ROLLBACK TO":
+            sp_name = value
+            assert isinstance(sp_name, str)
+            sps = savepoints[t.name]
+            if sp_name not in sps:
+                raise SimError(
+                    f"{t.name} 第 {t.pc} 条：保存点 “{sp_name}” 不存在或已失效"
+                )
+            target = sps[sp_name]
+            # 1) 撤销目标点之后的写入：版本标记为已回滚（保留在版本链上划线展示），
+            #    从事务生效写入清单中移除——提交、读己之写、最终状态与依赖图都不再计入。
+            undone = []
+            for wkey, wseq in t.writes[target["writes"]:]:
+                for v in chains[wkey]:
+                    if v.wseq == wseq and v.kind == "uncommitted":
+                        v.kind = "aborted"
+                        undone.append({"key": wkey, "vid": v.vid,
+                                       "value": v.value, "wseq": wseq})
+                        break
+            # 2) 撤销目标点之后的读依赖（历史读步骤本身保留）
+            discarded = [
+                {"key": rkey, "rseq": rseq, "vid": rvid}
+                for rkey, rseq, rvid in t.reads[target["reads"]:]
+            ]
+            del t.writes[target["writes"]:]
+            del t.reads[target["reads"]:]
+            # 3) 晚于目标建立的保存点失效；目标自身保留，可再次回退
+            sp_names = list(sps.keys())
+            target_idx = sp_names.index(sp_name)
+            invalidated = sp_names[target_idx + 1:]
+            for name in invalidated:
+                del sps[name]
+            # 4) 锁不释放、不降级
+            retained = _held(locks, t.name)
+            step["undone_writes"] = undone
+            step["discarded_reads"] = discarded
+            step["invalidated_savepoints"] = invalidated
+            step["locks_retained"] = retained
+            undone_desc = "、".join(f"{u['key']}=v{u['vid']}" for u in undone) or "无"
+            reads_desc = "、".join(
+                f"{d['key']}@第{d['rseq']}步" for d in discarded
+            ) or "无"
+            invalid_desc = "、".join(invalidated) if invalidated else "无"
+            step["info"] = (
+                f"回退到保存点 {sp_name}：撤销之后 {len(undone)} 个写入（{undone_desc}，"
+                f"版本链上保留并标记已回滚）、{len(discarded)} 条读依赖（{reads_desc}）；"
+                f"失效保存点：{invalid_desc}（{sp_name} 仍可再次回退）；"
+                f"继续持有 {len(retained)} 把锁（{_locks_desc(retained)}），"
+                f"不释放也不降级，其他事务继续等待；事务继续执行，"
+                f"后续读取只能看到仍有效的自身写入或已提交值"
+            )
+
         elif op == "COMMIT":
             t.status = "committed"
             t.commit_seq = seq
@@ -333,6 +424,7 @@ def simulate_s2pl(initial: "OrderedDict[str, Any]",
                         v.kind = "committed"
                         v.cseq = seq
             released = _release_all(locks, t.name)
+            savepoints[t.name].clear()
             step["locks_released"] = released
             step["info"] = (f"提交成功，{len(t.writes)} 个写入转为已提交版本；"
                             f"释放 {len(released)} 把锁（{_locks_desc(released)}）")
@@ -345,11 +437,13 @@ def simulate_s2pl(initial: "OrderedDict[str, Any]",
                     if v.wseq == wseq:
                         v.kind = "aborted"
             released = _release_all(locks, t.name)
+            savepoints[t.name].clear()
             step["locks_released"] = released
             step["info"] = (f"主动回滚，{len(t.writes)} 个写入全部作废；"
                             f"释放 {len(released)} 把锁（{_locks_desc(released)}）")
 
         step["txn_status_after"] = t.status
+        step["savepoints_after"] = list(savepoints[t.name].keys())
         finish_step(step)
 
     def record_wait(t: Txn, op: str, key: Optional[str], value: Any,
@@ -415,6 +509,7 @@ def simulate_s2pl(initial: "OrderedDict[str, Any]",
             released = _release_all(locks, victim)
             waits.pop(victim, None)
             vt.pc = len(vt.ops)  # 跳过剩余操作
+            savepoints[victim].clear()  # 整笔回滚：保存点一并作废
             deadlock_victims.add(victim)
             record_deadlock(vt, cycle, undone, released)
 
@@ -494,7 +589,8 @@ def simulate_s2pl(initial: "OrderedDict[str, Any]",
     return {
         "mode": "S2PL",
         "schedule": [
-            {"txn": s["txn"], "op": s["op"], "key": s["key"], "value": s["value"]}
+            {"txn": s["txn"], "op": s["op"], "key": s["key"], "value": s["value"],
+             "savepoint": s.get("savepoint")}
             for s in steps if s["event"] == "exec"
         ],
         "steps": steps,

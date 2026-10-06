@@ -66,7 +66,13 @@ class SimError(ValueError):
 # ---------------------------------------------------------------------------
 
 
-def parse_txn(name: str, text: str) -> List[Tuple[str, Optional[str], Optional[Any]]]:
+def parse_txn(name: str, text: str, allow_savepoint: bool = False
+              ) -> List[Tuple[str, Optional[str], Optional[Any]]]:
+    """解析一条事务脚本。
+
+    allow_savepoint=True 时额外允许 SAVEPOINT name 与 ROLLBACK TO name
+    （仅严格两阶段锁推演支持）；其余隔离级别保持只认五种基本操作。
+    """
     ops: List[Tuple[str, Optional[str], Optional[Any]]] = []
     for lineno, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
@@ -74,10 +80,20 @@ def parse_txn(name: str, text: str) -> List[Tuple[str, Optional[str], Optional[A
             continue
         parts = line.split()
         cmd = parts[0].upper()
-        if cmd not in VALID_OPS:
+        # “ROLLBACK TO name” 的首词为 ROLLBACK，仅在允许保存点时按整条命令识别
+        is_rollback_to = (
+            allow_savepoint and cmd == "ROLLBACK"
+            and len(parts) >= 2 and parts[1].upper() == "TO"
+        )
+        if cmd not in VALID_OPS and not (
+            allow_savepoint and (cmd == "SAVEPOINT" or is_rollback_to)
+        ):
+            allowed = "BEGIN / READ / WRITE / COMMIT / ABORT"
+            if allow_savepoint:
+                allowed += " / SAVEPOINT / ROLLBACK TO"
             raise SimError(
                 f"{name} 第 {lineno} 行：未知操作 “{parts[0]}”，"
-                "只允许 BEGIN / READ / WRITE / COMMIT / ABORT"
+                f"只允许 {allowed}"
             )
         if cmd == "READ":
             if len(parts) != 2:
@@ -95,10 +111,22 @@ def parse_txn(name: str, text: str) -> List[Tuple[str, Optional[str], Optional[A
             if len(parts) != 1:
                 raise SimError(f"{name} 第 {lineno} 行：COMMIT 不带参数")
             ops.append(("COMMIT", None, None))
-        else:  # ABORT
+        elif cmd == "ABORT":
             if len(parts) != 1:
                 raise SimError(f"{name} 第 {lineno} 行：ABORT 不带参数")
             ops.append(("ABORT", None, None))
+        elif cmd == "SAVEPOINT":
+            if len(parts) != 2:
+                raise SimError(
+                    f"{name} 第 {lineno} 行：SAVEPOINT 用法为 SAVEPOINT name"
+                )
+            ops.append(("SAVEPOINT", None, parts[1]))
+        elif is_rollback_to:  # ROLLBACK TO name
+            if len(parts) != 3:
+                raise SimError(
+                    f"{name} 第 {lineno} 行：回退保存点用法为 ROLLBACK TO name"
+                )
+            ops.append(("ROLLBACK TO", None, parts[2]))
     if not ops:
         raise SimError(f"{name} 脚本为空")
     if ops[0][0] != "BEGIN":

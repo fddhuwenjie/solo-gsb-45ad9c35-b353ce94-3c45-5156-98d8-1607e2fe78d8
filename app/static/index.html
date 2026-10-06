@@ -216,6 +216,17 @@
                border-radius: 4px; padding: 0 4px; margin-right: 4px; }
   .lock-mode.X { color: #ffb0b0; background: rgba(239,107,107,.15); }
   .lock-mode.S { color: #9be8c6; background: rgba(70,201,143,.12); }
+  /* 保存点 */
+  .chip.savepoint { border-color: #5a6fc0; background: rgba(91,140,255,.10); color: #a9c2ff; }
+  .chip.rollback-to { border-color: var(--purple); background: rgba(177,140,255,.12); color: #d3c1ff; }
+  .tag.savepoint { background: rgba(91,140,255,.18); color: #8fb0ff; }
+  .tag.rollback-to { background: rgba(177,140,255,.20); color: var(--purple); }
+  .step-card.rollback-to { border-color: rgba(177,140,255,.8); box-shadow: 0 0 0 1px rgba(177,140,255,.35); }
+  .step-card.savepoint { border-color: rgba(91,140,255,.65); }
+  .vbadge.hl-undo { box-shadow: 0 0 0 2px var(--purple); }
+  .ring-label.undo { background: var(--purple); }
+  .status-pill .sp-list { color: #b18cff; }
+  .alert.info { background: rgba(91,140,255,.10); border: 1px solid rgba(91,140,255,.5); color: #b9ccff; }
 </style>
 </head>
 <body>
@@ -267,7 +278,7 @@ y=0</textarea>
             <textarea id="t3" spellcheck="false"></textarea>
           </div>
         </div>
-        <div class="hint">每行仅允许：<code>BEGIN</code>、<code>READ key</code>、<code>WRITE key value</code>、<code>COMMIT</code>、<code>ABORT</code>；必须以 BEGIN 开头、COMMIT 或 ABORT 结尾。</div>
+        <div class="hint">每行仅允许：<code>BEGIN</code>、<code>READ key</code>、<code>WRITE key value</code>、<code>COMMIT</code>、<code>ABORT</code>；必须以 BEGIN 开头、COMMIT 或 ABORT 结尾。<br>「严格两阶段锁」标签额外支持事务内保存点 <code>SAVEPOINT name</code> 与 <code>ROLLBACK TO name</code>（仅 S2PL；含保存点的脚本自动只进入锁推演）。</div>
       </div>
     </div>
     <div class="actions" style="margin-top:16px">
@@ -353,7 +364,7 @@ const MODE_RULE = {
   RU: "每次读取取键上的最新写入（含其他事务未提交版本）。",
   RC: "每次读取只取键上最新已提交版本；不读未提交数据，也不看自己未提交的写。",
   SI: "读取基于 BEGIN 时的快照，自身写入优先；快照后同键被他人提交，则提交时整笔回滚（首提交者胜）。",
-  S2PL: "T1~T3 轮流尝试队头操作：READ 取共享锁、WRITE 取排他锁（共享锁可升级），锁持有到提交/回滚；冲突则保留队头等待、锁释放后重试；等待成环时回滚环内编号最大事务。读己之写优先，否则读按提交顺序最新的已提交版本。"
+  S2PL: "T1~T3 轮流尝试队头操作：READ 取共享锁、WRITE 取排他锁（共享锁可升级），锁持有到提交/回滚；冲突则保留队头等待、锁释放后重试；等待成环时回滚环内编号最大事务。读己之写优先，否则读按提交顺序最新的已提交版本。支持 SAVEPOINT name 与 ROLLBACK TO name：回退撤销该点之后的写入与读依赖（版本保留划线、锁不释放不降级），晚于目标的保存点失效、目标可再用。"
 };
 
 const EXAMPLES = [
@@ -426,6 +437,16 @@ const EXAMPLES = [
     txns: [
       "BEGIN\nREAD x\nWRITE x 9\nREAD x\nCOMMIT",
       "BEGIN\nREAD x\nWRITE x 8\nCOMMIT"
+    ]
+  },
+  {
+    name: "示例8 · 保存点回退",
+    desc: "S2PL：T1 读 x 后升级为排他锁写 x=9 并读己之写，ROLLBACK TO 撤销该写与读依赖——锁保持 X 不降级，T2 写 x 继续等待；回退后 T1 再读 x 读到初始值 0，提交后 T2 才得以执行。",
+    initial: "x=0",
+    enableT3: false,
+    txns: [
+      "BEGIN\nREAD x\nSAVEPOINT s\nWRITE x 9\nREAD x\nROLLBACK TO s\nREAD x\nCOMMIT",
+      "BEGIN\nWRITE x 2\nCOMMIT"
     ]
   }
 ];
@@ -504,20 +525,28 @@ async function run() {
   } catch (e) {
     return showError("网络错误：" + e.message);
   }
-  const data = await simResp.json();
-  if (!simResp.ok) {
-    return showError(data.detail || "推演失败");
-  }
+  let data = await simResp.json();
   const s2plData = await s2plResp.json();
   if (!s2plResp.ok) {
+    // S2PL 是含保存点脚本的主入口：锁推演失败须明确报错
     return showError(s2plData.detail || "S2PL 推演失败");
   }
+  // SAVEPOINT / ROLLBACK TO 仅锁推演支持：普通模式不识别时降级为只展示 S2PL
+  const simOk = !!simResp.ok;
+  if (!simOk) {
+    const usesSavepoint = txns.some(t => /^\s*(SAVEPOINT|ROLLBACK\s+TO)\b/m.test(t));
+    if (!usesSavepoint) {
+      return showError(data.detail || "推演失败");
+    }
+  }
   hideError();
+  data = simOk ? data : { results: {} };
   data.results.S2PL = s2plData.result;
+  data.s2pl_only = !simOk;
   state.data = data;
   state.cmp = null;
   state.view = "single";
-  state.mode = "RU";
+  state.mode = simOk ? "RU" : "S2PL";
   state.idx = 0;
   $("emptyHint").style.display = "none";
   $("resultSection").style.display = "";
@@ -573,6 +602,11 @@ async function runCompare() {
   const data = await resp.json();
   if (!resp.ok) {
     clearCompare();  // 提示错误并清除页面旧对照
+    const usesSavepoint = txns.some(t => /^\s*(SAVEPOINT|ROLLBACK\s+TO)\b/m.test(t));
+    if (usesSavepoint) {
+      return showError((data.detail || "对照推演失败") +
+        "（SAVEPOINT / ROLLBACK TO 仅严格两阶段锁推演支持，不参与 RU/RC/SI 调度对照；请点「生成调度并推演」查看锁推演）");
+    }
     return showError(data.detail || "对照推演失败");
   }
   hideError();
@@ -798,7 +832,11 @@ function opShort(step) {
   let base;
   if (step.op === "READ") base = `READ ${step.key}`;
   else if (step.op === "WRITE") base = `WRITE ${step.key} ${fmt(step.value)}`;
+  else if (step.op === "SAVEPOINT") base = `SAVEPOINT ${step.savepoint}`;
+  else if (step.op === "ROLLBACK TO") base = `ROLLBACK TO ${step.savepoint}`;
   else base = step.op;
+  if (step.op === "ROLLBACK TO") return `↩ ${base}`;
+  if (step.op === "SAVEPOINT") return `⚓ ${base}`;
   return step.event === "wait" ? `⏳ ${base}` : base;
 }
 
@@ -814,6 +852,8 @@ function renderChips(r) {
       (s.dirty_candidate ? " dirty" : "") +
       (s.event === "wait" ? " wait" : "") +
       (s.event === "deadlock" ? " deadlock" : "") +
+      (s.op === "SAVEPOINT" ? " savepoint" : "") +
+      (s.op === "ROLLBACK TO" ? " rollback-to" : "") +
       (s.seq === fdSeq ? " firstdiff" : "");
     c.innerHTML = `<span class="cseq">${s.seq}</span>${s.txn} ${esc(opShort(s))}`;
     c.onclick = () => { stopPlay(); state.idx = i; render(); };
@@ -898,13 +938,18 @@ function lockListText(list) {
 function renderStepS2PL(step) {
   const card = $("stepCard");
   card.className = "step-card" +
-    (step.event === "deadlock" ? " deadlock" : step.event === "wait" ? " wait" : "");
+    (step.event === "deadlock" ? " deadlock"
+      : step.event === "wait" ? " wait"
+      : step.op === "ROLLBACK TO" ? " rollback-to"
+      : step.op === "SAVEPOINT" ? " savepoint" : "");
   let tags = "";
   if (step.event === "wait") tags += `<span class="tag wait">锁冲突等待</span>`;
   if (step.event === "deadlock") tags += `<span class="tag deadlock">死锁回滚</span>`;
   if (step.resumed) tags += `<span class="tag info">重试成功</span>`;
   if (step.lock_acquired && step.lock_acquired.upgrade)
     tags += `<span class="tag info">S→X 升级</span>`;
+  if (step.op === "SAVEPOINT") tags += `<span class="tag savepoint">⚓ 建立保存点</span>`;
+  if (step.op === "ROLLBACK TO") tags += `<span class="tag rollback-to">↩ 回退到保存点</span>`;
 
   let inner = `
     <div class="step-top">
@@ -931,6 +976,29 @@ function renderStepS2PL(step) {
       <span class="k">撤销写入</span><span class="v">${undone}</span>
       <span class="k">释放锁</span><span class="v">${lockListText(step.locks_released)}</span>
       <span class="k">剩余操作</span><span class="v">全部跳过</span>
+    </div>`;
+  } else if (step.op === "SAVEPOINT") {
+    const sps = (step.txns_after[step.txn].savepoints || []);
+    inner += `<div class="kv-mini">
+      <span class="k">保存点名</span><span class="v">⚓ ${esc(step.savepoint)}</span>
+      <span class="k">本事务有效保存点</span><span class="v">${sps.length ? sps.map(s => esc(s.name)).join("、") : "无"}</span>
+      <span class="k">持锁</span><span class="v">${lockListText(step.txns_after[step.txn].locks)}</span>
+    </div>`;
+  } else if (step.op === "ROLLBACK TO") {
+    const uw = (step.undone_writes || []);
+    const dr = (step.discarded_reads || []);
+    const inv = step.invalidated_savepoints || [];
+    inner += `<div class="kv-mini">
+      <span class="k">回退目标</span><span class="v">⚓ ${esc(step.savepoint)}（回退后仍保留，可再次回退）</span>
+      <span class="k">撤销写入</span><span class="v">${uw.length
+        ? uw.map(u => `${esc(u.key)} v${u.vid}=${esc(fmt(u.value))}`).join("，") + "（版本保留、标记已回滚）"
+        : "无"}</span>
+      <span class="k">撤销读依赖</span><span class="v">${dr.length
+        ? dr.map(d => `第 ${d.rseq} 步读 ${esc(d.key)}${d.vid == null ? "" : `(v${d.vid})`}`).join("，")
+        : "无"}（历史步骤保留）</span>
+      <span class="k">失效保存点</span><span class="v">${inv.length ? inv.map(esc).join("、") : "无"}</span>
+      <span class="k">仍持有锁</span><span class="v">${lockListText(step.locks_retained)}（不释放、不降级）</span>
+      <span class="k">有效保存点</span><span class="v">${(step.savepoints_after || []).length ? step.savepoints_after.map(esc).join("、") : "无"}</span>
     </div>`;
   } else if (step.op === "READ" && step.read_source !== "missing") {
     inner += `<div class="kv-mini">
@@ -1023,6 +1091,8 @@ function renderChains(step) {
       if (v.vid === step.read_vid) { hl = " hl-read"; ring = `<span class="ring-label read">读</span>`; }
       if (v.vid === step.new_vid) { hl = " hl-write"; ring = `<span class="ring-label write">写</span>`; }
       if (v.vid === step.conflict_vid) { hl = " hl-conflict"; ring = `<span class="ring-label conflict">冲突</span>`; }
+      const undoVids = new Set((step.undone_writes || []).map(u => u.vid));
+      if (undoVids.has(v.vid)) { hl = " hl-undo"; ring = `<span class="ring-label undo">撤</span>`; }
       const kindLabel = { initial: "初始", uncommitted: "未提交", committed: "已提交", aborted: "已回滚" }[v.kind];
       html += `<div class="vbadge ${v.kind}${hl}">
         ${ring}
@@ -1049,10 +1119,13 @@ function renderStatus(step) {
     let lockTxt = "";
     if (st.locks && st.locks.length)
       lockTxt = " [" + st.locks.map(l => `${l.key}:${l.mode}`).join(" ") + "]";
+    let spTxt = "";
+    if (st.savepoints && st.savepoints.length)
+      spTxt = ` <span class="sp-list">⚓ ${st.savepoints.map(s => esc(s.name)).join("、")}</span>`;
     const waitTxt = st.waiting ? " ⏳等待中" : "";
     pill.style.borderColor = (st.status === "active" || st.status === "committed") && !st.waiting
       ? (name === "T1" ? "var(--t1)" : name === "T2" ? "var(--t2)" : "var(--t3)") : undefined;
-    pill.innerHTML = `${name}：${statusLabel(st.status)}${waitTxt}<span style="opacity:.7">${tail}${lockTxt}</span>`;
+    pill.innerHTML = `${name}：${statusLabel(st.status)}${waitTxt}<span style="opacity:.7">${tail}${lockTxt}</span>${spTxt}`;
     box.appendChild(pill);
   }
 }
@@ -1065,6 +1138,10 @@ function renderAlerts(r) {
   const box = $("alertsBox");
   if (state.mode === "S2PL") {
     let html = "";
+    if (state.data && state.data.s2pl_only) {
+      html += `<div class="alert info"><strong>ℹ 脚本含 SAVEPOINT / ROLLBACK TO，仅严格两阶段锁推演支持：</strong>` +
+        `已自动只展示锁推演标签，RU / RC / SI 与调度对照不识别该语法（普通脚本仍四标签并排）。</div>`;
+    }
     const dls = r.deadlocks || [];
     if (dls.length) {
       html += `<div class="alert cycle"><strong>⚠ 死锁处理 ${dls.length} 次（回滚环内编号最大的事务）</strong>
@@ -1072,7 +1149,14 @@ function renderAlerts(r) {
     } else {
       html += `<div class="alert ok">✔ 本次调度未发生死锁。</div>`;
     }
-    html += `<div class="alert ok" style="font-size:12px">严格两阶段锁：锁持有到提交/回滚才释放，不产生脏读与不可重复读；回滚事务的写入不出现在任何后续读取与最终状态中。</div>`;
+    const rollbacks = (r.steps || []).filter(s => s.op === "ROLLBACK TO");
+    if (rollbacks.length) {
+      html += `<div class="alert info"><strong>↩ 保存点回退 ${rollbacks.length} 次</strong>
+        <ul>${rollbacks.map(s => `<li>第 ${s.seq} 步：${esc(s.txn)} 回退到 ${esc(s.savepoint)}，` +
+          `撤销 ${(s.undone_writes || []).length} 个写入、${(s.discarded_reads || []).length} 条读依赖，` +
+          `仍持 ${(s.locks_retained || []).length} 把锁（不释放不降级）</li>`).join("")}</ul></div>`;
+    }
+    html += `<div class="alert ok" style="font-size:12px">严格两阶段锁：锁持有到提交/回滚才释放，不产生脏读与不可重复读；回滚事务与保存点回退撤销的写入均不出现在任何后续读取、最终状态与依赖图中。ROLLBACK TO 只撤销保存点之后的读写，已取得的 S/X 锁保留。</div>`;
     box.innerHTML = html;
     return;
   }
